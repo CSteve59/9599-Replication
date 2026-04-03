@@ -62,9 +62,9 @@ Note that the Manifesto Project data requires free registration at manifesto-pro
 
 ---
 
-**Option B: Download pre-packaged files from Harvard Dataverse** (This isn't working download from google drive link)
+**Option B: Download pre-packaged files from Harvard Dataverse** 
 
-A single archive containing all data and code for this replication is available at: `[HARVARD LINK]`
+A single archive containing all data and code for this replication is available at: `[HARVARD LINK]` **(This isn't working download from google drive link)**
 
 - **Full archive** — Includes the raw data, cleaned data, and all code. Download and extract into the project root, then skip directly to Step 3 (analyses only) or re-run everything from Step 3 (cleaning + analyses).
 - **Data only** — Includes raw and cleaned datasets. Place this in the project repository beside the other folders (besides "code" and "figures" folders).
