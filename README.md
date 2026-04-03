@@ -1,8 +1,10 @@
 # Replication: "Liberals Lecture, Conservatives Communicate"
 
 **Author:** Colton Stevenson
+
 **Course:** P.S. 9599 – Text Analysis
-**Date:** March 2026
+
+**Date:** April 3rd 2026
 
 ## Paper
 
