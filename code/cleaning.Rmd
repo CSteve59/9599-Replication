@@ -1,0 +1,833 @@
+---
+title: "Data Cleaning – Replication of Schoonvelde et al. (2019)"
+author: "Colton Stevenson"
+date: "April 3rd 2026"
+output:
+  html_document:
+    theme: darkly
+    toc: true
+    toc_float: 
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 5
+    highlight: zenburn
+---
+
+## Overview
+
+This notebook handles all data cleaning for the replication of:
+
+> Schoonvelde, M., Brosius, A., &"; van Atteveldt, W. (2019). Liberals lecture,
+> conservatives communicate: Analyzing complexity and ideology in 381,609
+> political speeches. *PLOS ONE*, 14(2), e0208450.
+
+We start from publicly available raw datasets, clean them to match the paper's
+specifications, calculate ideology scores from the Manifesto Project, compute
+Flesch-Kincaid complexity scores, and produce a final analysis-ready `.RData`
+file.
+
+**Inputs:**
+
+- `data/raw/ParlSpeech/` — Five European parliament corpora
+- `data/raw/EUSpeech/supercorpus_unstemmed_V4.RData` — EU elite speeches (unstemmed V4)
+- `data/raw/PartyCongressSpeech/corpus_DK_NL.Rdata` — Danish and Dutch party congress speeches
+- `data/raw/ManifestoProject/ManifestoProject2019.xlsx` — Manifesto Project (2019 version)
+
+**Output:**
+
+- `data/cleaned/cole_final_cleaned_data.RData` — Final cleaned dataset with all variables
+
+---
+
+## Setup
+
+### Libraries
+
+```{r load-libraries, message = FALSE, warning = FALSE}
+
+library(tidyverse)          # data wrangling
+library(tidylog)            # verbose output for dplyr operations
+library(tidytext)           # tidy text manipulation
+library(textdata)           # text datasets
+library(quanteda)           # corpus and tokenization
+library(quanteda.textstats) # readability scores (Flesch-Kincaid)
+library(wesanderson)        # colour palettes
+library(knitr)              # table formatting
+library(stringr)            # string manipulation
+library(readxl)             # reading .xlsx files
+library(cld2)               # language detection
+
+```
+
+### Load Raw Data
+
+All paths are relative to the project root.
+
+```{r load-data, warning = FALSE}
+
+# Set working directory to the project root (one level up from /code)
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+setwd("..")
+
+# ---------------------------------------------------------------------------
+# ParlSpeech: Speeches from five European parliaments
+# Source: https://doi.org/10.7910/DVN/E4RSP9
+# ---------------------------------------------------------------------------
+load("data/raw/ParlSpeech/Corp_Bundestag.Rdata")      # German Bundestag
+load("data/raw/ParlSpeech/Corp_Congresso.Rdata")       # Spanish Congresso
+load("data/raw/ParlSpeech/Corp_HouseOfCommons.Rdata")  # British House of Commons
+load("data/raw/ParlSpeech/Corp_Riksdag.Rdata")         # Swedish Riksdag
+load("data/raw/ParlSpeech/Corp_TweedeKamer.Rdata")     # Dutch Tweede Kamer
+
+# ---------------------------------------------------------------------------
+# EUSpeech: Speeches from EU elites and heads of state/government
+# Source: https://doi.org/10.7910/DVN/GKABNU (updated V4 with unstemmed text)
+# Note: The DOI cited in the paper (DVN/XPCVEI) links to the 2016 version,
+#       which only contains stemmed/cleaned text. The V4 unstemmed corpus is
+#       the correct one to use for Flesch-Kincaid scoring.
+# ---------------------------------------------------------------------------
+load("data/raw/EUSpeech/supercorpus_unstemmed_V4.RData")
+
+# ---------------------------------------------------------------------------
+# Party Congress Speeches: Denmark and the Netherlands (1945-2017)
+# Source: https://doi.org/10.7910/DVN/SFZI8O
+# ---------------------------------------------------------------------------
+load("data/raw/PartyCongressSpeech/corpus_DK_NL.Rdata")
+
+# ---------------------------------------------------------------------------
+# Manifesto Project: Party ideology scores (2019 version)
+# Source: https://manifesto-project.wzb.eu/ (registration required)
+# ---------------------------------------------------------------------------
+manifesto <- read_excel("data/raw/ManifestoProject/ManifestoProject2019.xlsx")
+
+```
+
+---
+
+## Pre-Cleaning
+
+Before the substantive cleaning, we simplify each dataset by selecting only the
+variables we need and merging the five ParlSpeech corpora into one dataframe.
+We also set up optional sampling for faster testing during development.
+
+```{r pre-cleaning}
+
+# Combine all five ParlSpeech corpora into one dataframe
+parlspeech_raw <- bt.corpus |>
+  rbind(cong.corpus, hoc.corpus, rd.corpus, tk.corpus) |>
+  select(date, speaker, party, chair, terms, text, parliament)
+
+# EUSpeech: extract the documents dataframe from the corpus list object
+euspeech_raw <- corpus_unstemmed[["documents"]]
+
+# Party Congresses: extract documents and keep key variables
+partycong_raw <- corpus[["documents"]] |>
+  select(year, speaker, party, texts, country)
+
+# Manifesto Project: keep country, date, party info, and all "per" issue codes
+manifesto_raw <- manifesto |>
+  select(countryname, date, edate, partyname, partyabbrev, starts_with("per"))
+
+```
+
+### Sampling (For Testing)
+
+During development, we used a sample of 10,000 speeches per dataset to speed up
+testing. For the final results, we use the full dataset (set `n_sam <- Inf`).
+
+```{r sampling}
+
+# Toggle between sample and full data:
+ n_sam <- 10000  # sample for testing
+# n_sam <- Inf      # full dataset for final results (ParlSpeech takes ~7 min)
+
+parlspeech_sample <- slice_sample(parlspeech_raw, n = n_sam)
+euspeech_sample   <- slice_sample(euspeech_raw,   n = n_sam)
+partycong_sample  <- slice_sample(partycong_raw,   n = n_sam)
+
+```
+
+---
+
+## Cleaning
+
+### ParlSpeech
+
+The paper specifies two filters for parliamentary speeches:
+
+1. Exclude all chairperson speeches (they organize debate, not substantive)
+2. Keep only speeches with at least 10 sentences of at least 5 words
+
+We also remap party abbreviations to match the Manifesto Project naming
+conventions, which is necessary for the ideology merge later.
+
+```{r clean-parlspeech}
+
+parlspeech_clean <- parlspeech_sample |>
+  filter(chair == "FALSE") |> # Removing Chair Speeches
+  # Regex: match sentences with >= 5 words ending in punctuation; keep if >= 10
+  filter(str_count(text, "\\b\\w+\\b(?:\\s+\\b\\w+\\b){4,}\\s*[.!?;:]") >= 10) |>
+  mutate(
+    # Add country names for later merging with Manifesto data
+    countryname = case_when(
+      parliament == "NL-TweedeKamer" ~ "Netherlands",
+      parliament == "ES-Congresso"   ~ "Spain",
+      parliament == "UK-HoC"         ~ "United Kingdom",
+      parliament == "SE-Riksdag"     ~ "Sweden",
+      parliament == "DE-Bundestag"   ~ "Germany"
+    )
+  ) |>
+  mutate(
+    # Remap party abbreviations to match Manifesto Project conventions
+    speech_year = year(as.Date(date)),
+    party = case_when(
+      # United Kingdom
+      party == "Con"        ~ "Conservatives",
+      party == "Lab"        ~ "Labour",
+      party == "LibDem"     ~ "LibDems",
+      party == "PlaidCymru" ~ "PC",
+      # Germany — PDS/LINKE renamed to LINKE after 2007
+      party == "GRUENE"     ~ "90/Greens",
+      party == "PDS/LINKE" & speech_year >= 2007 ~ "LINKE",
+      party == "PDS/LINKE" & speech_year < 2007  ~ "PDS",
+      # Sweden
+      party == "S"   ~ "SAP",
+      party == "C"   ~ "CP",
+      party == "KD"  ~ "Kd",
+      party == "M"   ~ "MSP",
+      party == "NYD" ~ "NyD",
+      party == "L"   ~ "L",
+      # Netherlands
+      party == "D66" ~ "D'66",
+      # Spain
+      party == "PNV"    ~ "PNV/EAJ",
+      party == "IU-ICV" ~ "IU",
+      TRUE ~ party
+    )
+  )
+
+```
+
+### EUSpeech
+
+The EUSpeech dataset required more work than ParlSpeech because:
+
+- The raw data does not include party or full speaker information
+- The DOI in the paper links to a 2016 version with stemmed/cleaned text
+- We need the unstemmed V4 version for accurate Flesch-Kincaid scoring
+
+#### Adding Speaker Information
+
+The original dataset only includes speaker names (often abbreviated) without
+party affiliations. We built a lookup table mapping each speaker to their party
+and Manifesto Project abbreviation.
+
+**Note: An LLM (Claude) was used to assist with researching the party
+affiliations and abbreviations for each speaker in the dataset. All entries
+were verified against publicly available sources.**
+
+```{r euspeech-speaker-info}
+
+# Lookup table: speaker -> party name and Manifesto Project abbreviation
+# Built with LLM assistance for researching ~60 speakers' party affiliations
+speaker_info <- tribble(
+  ~speaker,               ~party,                                               ~partyabbrev,
+  "J.L.R. Zapatero",     "Spanish Socialist Workers' Party",                   "PSOE",
+  "M. Rutte",            "People's Party for Freedom and Democracy",           "VVD",
+  "Francesco Speroni",   "Northern League",                                    "LN",
+  "A. Merkel",           "Christian Democratic Union/Christian Social Union",  "CDU/CSU",
+  "Marine Le Pen",       "National Front",                                     "FN",
+  "European Commission", "EU Institution",                                     NA,
+  "F. Hollande",         "Socialist Party",                                    "PS",
+  "Michal Kaminski",     "Law and Justice",                                    "PiS",
+  "Martin Schulz",       "Social Democratic Party of Germany",                 "SPD",
+  "M. Rajoy",            "People's Party",                                     "PP",
+  "Francis Wurtz",       "French Communist Party",                             "PCF",
+  "IMF",                 "International Institution",                          NA,
+  "M. Monti",            "Civic Choice",                                       "SC",
+  "Rebecca Harms",       "Alliance'90/Greens",                                 "90/Greens",
+  "G.A. Papandreou",     "Panhellenic Socialist Movement",                     "PASOK",
+  "H. van Rompuy",       "Christian Democratic and Flemish",                   "CD&V",
+  "S. Berlusconi",       "People of Freedom",                                  "PdL",
+  "G. Brown",            "Labour Party",                                       "Labour",
+  "J.P. Balkenende",     "Christian Democratic Appeal",                        "CDA",
+  "N. Sarkozy",          "Union for a Popular Movement",                       "UMP",
+  "Guy Verhofstadt",     "Open Flemish Liberals and Democrats",                "openVLD",
+  "A. Samaras",          "New Democracy",                                      "ND",
+  "R. Prodi",            "Democratic Party",                                   "PD",
+  "Monica Frassoni",     "Alliance'90/Greens",                                 "90/Greens",
+  "Daniel Cohn-Bendit",  "Alliance'90/Greens",                                 "90/Greens",
+  "ECB",                 "EU Institution",                                     NA,
+  "A. Tsipras",          "Coalition of the Radical Left",                      "SYRIZA",
+  "Martin Callanan",     "Conservative Party",                                 "Conservatives",
+  "Cristiana Muscardini","National Alliance",                                  "AN",
+  "B. Sobotka",          "Czech Social Democratic Party",                      "CSSD",
+  "Passos Coelho",       "Social Democratic Party",                            "PSD",
+  "D. Cameron",          "Conservative Party",                                 "Conservatives",
+  "Manfred Weber",       "Christian Democratic Union/Christian Social Union",  "CDU/CSU",
+  "Brian Crowley",       "Soldiers of Destiny",                                NA,
+  "Jan Zahradil",        "Civic Democratic Party",                             "ODS",
+  "Hannes Swoboda",      "Austrian Social Democratic Party",                   "SPO",
+  "Graham Watson",       "Liberal Democrats",                                  "LibDems",
+  "Joseph Daul",         "Union for a Popular Movement",                       "UMP",
+  "Gabriele Zimmer",     "The Left",                                           "LINKE",
+  "David Borrelli",      "Five Star Movement",                                 "M5S",
+  "Nigel Farage",        "United Kingdom Independence Party",                  "UKIP",
+  "L. Papademos",        "Independent",                                        NA,
+  "Jose Socrates",       "Socialist Party",                                    "PS",
+  "Lothar Bisky",        "The Left",                                           "LINKE",
+  "Kathy Sinnott",       "Independent",                                        NA,
+  "Marcel de Graaff",    "Party of Freedom",                                   "PVV",
+  "Philippe Lamberts",   "Ecologists",                                         "ECOLO",
+  "E. Letta",            "Democratic Party",                                   "PD",
+  "Donald Tusk",         "Civic Platform",                                     "PO",
+  "Gianni Pittella",     "Democratic Party",                                   "PD",
+  "D. Tusk",             "Civic Platform",                                     "PO",
+  "J. Fischer",          "Alliance'90/Greens",                                 "90/Greens",
+  "T. Blair",            "Labour Party",                                       "Labour",
+  "M. Renzi",            "Democratic Party",                                   "PD",
+  "P. Necas",            "Civic Democratic Party",                             "ODS",
+  "Syed Kamall",         "Conservative Party",                                 "Conservatives",
+  "J. Chirac",           "Rally for the Republic",                             "RPR",
+  "Antonia Costa",       "Socialist Party",                                    "PS",
+  "Beaty Szydlo",        "Law and Justice",                                    "PiS",
+  "Ewa Kopacz",          "Civic Platform",                                     "PO"
+)
+
+# Join speaker info, recode country, filter for English non-translated speeches
+euspeech_clean <- euspeech_sample |>
+  left_join(speaker_info, by = "speaker") |>
+  mutate(country = recode(country, "Great Britain" = "United Kingdom")) |>
+  filter(language == "en" & translation == 0) |>    # filtering language + no translation
+  filter(country %in% c(   # Setting right countries
+    "Czech Republic", "Germany", "Greece", "Netherlands", "Italy",
+    "Spain", "United Kingdom", "Poland", "Portugal", "France"
+  ))
+
+```
+
+#### Filtering Speakers
+
+The paper excludes Italian PM Prodi (only 3 English speeches) and Portuguese PM
+Passos Coelho (only 6 speeches) due to insufficient data.
+
+```{r euspeech-filtering}
+
+euspeech_clean <- euspeech_clean |>
+  filter(speaker != "Passos Coelho") |>
+  filter(speaker != "R. Prodi")
+
+```
+
+### Party Congresses
+
+We filter to only the parties specified in the paper and handle the historical
+merger of ARP, CHU, and KVP into the Christian Democratic Appeal (CDA). We keep
+a separate `manifesto_party` column so that pre-CDA speeches (before ~1980) can
+be matched to the correct historical party's ideology scores.
+
+```{r clean-party-congresses}
+
+partycong_clean <- partycong_sample |>
+  # Keep only the parties specified in the paper
+  filter(party %in% c(
+    "DF", "EL", "S", "SF", "V",                             # Denmark
+    "SP", "Groenlinks", "PvdA", "VVD", "ARP", "CHU", "KVP", # Netherlands
+    "CDA", "D66", "PVV"
+  )) |>
+  mutate(
+    # Preserve original abbreviation for Manifesto matching (pre-CDA parties)
+    manifesto_party = case_when(
+      party == "ARP" ~ "ARP",
+      party == "CHU" ~ "CHU",
+      party == "KVP" ~ "KVP",
+      party == "CDA" ~ "CDA",
+      TRUE           ~ party
+    ),
+    # Merge ARP/CHU/KVP into CDA for the analysis (as per the paper)
+    party = case_when(
+      party %in% c("ARP", "CHU", "KVP", "CDA") ~ "CDA",
+      TRUE ~ party
+    )
+  ) |>
+  mutate(
+    # Add full party names for readability
+    party_name = case_when(
+      party == "DF"         ~ "Danish People's Party",
+      party == "EL"         ~ "Unity List",
+      party == "S"          ~ "Social Democrats",
+      party == "SF"         ~ "Socialist People's Party",
+      party == "V"          ~ "Venstre",
+      party == "SP"         ~ "Socialist Party",
+      party == "Groenlinks" ~ "Green Left",
+      party == "PvdA"       ~ "Labour Party",
+      party == "VVD"        ~ "VVD",
+      party == "CDA"        ~ "Christian Democratic Appeal",
+      party == "D66"        ~ "D66",
+      party == "PVV"        ~ "Freedom Party"
+    )
+  ) |>
+  mutate(
+    countryname = case_when(
+      country == "DK" ~ "Denmark",
+      country == "NL" ~ "Netherlands"
+    )
+  ) |>
+  mutate(
+    # Remap abbreviations to match Manifesto Project conventions
+    party = case_when(
+      party == "S"          & countryname == "Denmark"     ~ "SD",
+      party == "D66"        & countryname == "Netherlands" ~ "D'66",
+      party == "Groenlinks" & countryname == "Netherlands" ~ "GL",
+      TRUE ~ party
+    ),
+    manifesto_party = case_when(
+      manifesto_party == "S"          & countryname == "Denmark"     ~ "SD",
+      manifesto_party == "D66"        & countryname == "Netherlands" ~ "D'66",
+      manifesto_party == "Groenlinks" & countryname == "Netherlands" ~ "GL",
+      TRUE ~ manifesto_party
+    )
+  )
+
+```
+
+---
+
+## Ideology Scores (Manifesto Project)
+
+The paper uses two ideological dimensions derived from the Manifesto Project:
+
+The Liberal Conservative scale is calculated using this formula:
+
+$$ideo=log(\sum{conservative~issues + 0.5)} - log(\sum{libeal~issues + 0.5)}$$
+
+In which conservative and liberal issues are decided as such:
+
+- **Conservative issues:** 
+	- anti-EU
+	- anti-immigration
+	- pro-national way of life
+	- pro-traditional morality
+	- anti-multiculturalism
+	- pro-military
+	- anti-internationalism
+	- pro-Freedom and Human Right
+	- pro-political authority
+	- pro-law and order
+- **Liberal Issues:**
+	- pro-EU
+	- pro-immigration
+	- anti-national way of life
+	- anti-traditional morality
+	- pro-multiculturalism
+	- antimilitary
+	- pro-internationalism
+	- anti-imperialism
+	- pro-peace
+	- pro-environment
+	- pro-culture
+	- support for under-privileged minority groups.
+	
+The economic left / right scale is calculated using this formula:
+
+$$ideo=log(\sum{left~issues + 0.5)} - log(\sum{right~issues + 0.5)}$$
+
+In which right and left economic issues are decided as such:
+
+- **Right issues:** 
+	- free-market economy
+	- incentives
+	- protectionism: negative
+	- economic growth: positive
+	- economic orthodoxy
+	- welfare state limitation
+	- labour groups: negative
+- **Left Issues:**
+	- market regulation
+	- economic planning
+	- corporatism
+	- protectionism: positive
+	- Keynesian demand management
+	- controlled economy
+	- nationalisation
+	- Marxist analysis
+	- welfare state expansion
+	- education expansion
+	- support for labour groups
+
+```{r ideology-scores}
+
+manifesto_clean <- manifesto_raw |>
+  # Normalize the apostrophe in D'66
+  mutate(partyabbrev = str_replace_all(partyabbrev, "\u2019", "'")) |>
+  mutate(
+    # --- Liberal-Conservative cultural dimension ---
+    # Conservative issues (Manifesto Project codes)
+    conservative_sum = per110 + per601 + per603 + per608 + per104 +
+                       per109 + per201 + per305 + per605,
+    # Liberal issues
+    liberal_sum      = per108 + per602 + per604 + per607 + per105 +
+                       per107 + per103 + per106 + per501 + per502 + per705,
+    lib_con_scale    = log(conservative_sum + 0.5) - log(liberal_sum + 0.5),
+
+    # --- Left-Right economic dimension ---
+    right_sum = per401 + per402 + per407 + per410 + per414 + per505 + per702,
+    left_sum  = per403 + per404 + per405 + per406 + per409 + per412 +
+                per413 + per415 + per504 + per506 + per701,
+    left_right_scale = log(left_sum + 0.5) - log(right_sum + 0.5)
+  ) |>
+  select(countryname, date, edate, partyname, partyabbrev,
+         lib_con_scale, left_right_scale)
+
+```
+
+### Merging Ideology Into Speech Datasets
+
+Ideology scores change over time (updated each election), so we match each
+speech to the most recent manifesto published *before* the speech date. This
+is done by joining on party abbreviation and country, then filtering for the
+latest manifesto that predates the speech.
+
+```{r merge-ideology}
+
+# Prepare manifesto dates for time-aware joining
+manifesto_clean <- manifesto_clean |>
+  mutate(
+    manifesto_year  = as.integer(str_sub(date, 1, 4)),
+    manifesto_month = as.integer(str_sub(date, 5, 6))
+  ) |>
+  rename(manifesto_date = date)
+
+# --- ParlSpeech ---
+parlspeech_ideology <- parlspeech_clean |>
+  mutate(
+    speech_year  = year(as.Date(date)),
+    speech_month = month(as.Date(date))
+  ) |>
+  left_join(manifesto_clean, by = c("party" = "partyabbrev", "countryname")) |>
+  # Keep only manifesto scores from before or during the speech date
+  filter(
+    manifesto_year < speech_year |
+    (manifesto_year == speech_year & manifesto_month <= speech_month)
+  ) |>
+  # Keep the most recent manifesto for each speech
+  group_by(speaker, date) |>
+  slice_max(order_by = manifesto_year * 100 + manifesto_month) |>
+  ungroup()
+
+# --- Party Congresses ---
+# Uses manifesto_party (not party) so pre-CDA parties get their own scores
+partycong_ideology <- partycong_clean |>
+  mutate(speech_year = as.integer(year)) |>
+  left_join(manifesto_clean,
+            by = c("manifesto_party" = "partyabbrev", "countryname")) |>
+  filter(manifesto_year <= speech_year) |>
+  group_by(speaker, year) |>
+  slice_max(order_by = manifesto_year * 100 + manifesto_month) |>
+  ungroup()
+
+# --- EUSpeech ---
+euspeech_ideology <- euspeech_clean |>
+  mutate(
+    date_parsed  = as.Date(date, format = "%d-%m-%Y"),
+    speech_year  = year(date_parsed),
+    speech_month = month(date_parsed)
+  ) |>
+  left_join(manifesto_clean,
+            by = c("partyabbrev", "country" = "countryname")) |>
+  filter(
+    manifesto_year < speech_year |
+    (manifesto_year == speech_year & manifesto_month <= speech_month)
+  ) |>
+  group_by(speaker, date) |>
+  slice_max(order_by = manifesto_year * 100 + manifesto_month) |>
+  ungroup()
+
+```
+
+---
+
+## Complexity (Flesch-Kincaid Grade Level)
+
+Speech complexity is measured using the Flesch-Kincaid Grade Level formula:
+
+$$score = 0.39 \times \frac{\text{total words}}{\text{total sentences}} + 11.8 \times \frac{\text{total syllables}}{\text{total words}} - 15.59$$
+
+We use `quanteda.textstats::textstat_readability()` for this calculation.
+
+**Note:** ParlSpeech is very large (~700k speeches after filtering), so we split
+it into 3 chunks to avoid exceeding 32 GB of RAM.
+
+```{r complexity, message = FALSE}
+
+# --- ParlSpeech: chunked to avoid memory issues ---
+n <- nrow(parlspeech_ideology)
+chunk_size <- ceiling(n / 3)
+chunks <- split(parlspeech_ideology, ceiling(seq_len(n) / chunk_size))
+
+fk_scores <- lapply(seq_along(chunks), function(i) {
+  message("Processing ParlSpeech chunk ", i, " of ", length(chunks))
+  corp <- corpus(chunks[[i]], text_field = "text")
+  textstat_readability(corp, measure = "Flesch.Kincaid")
+}) |> bind_rows()
+
+parlspeech_ideology$flesch_kincaid <- fk_scores$Flesch.Kincaid
+
+# --- EUSpeech ---
+corpus_eu <- corpus(euspeech_ideology, text_field = "texts")
+fk_eu     <- textstat_readability(corpus_eu, measure = "Flesch.Kincaid")
+euspeech_ideology$flesch_kincaid <- fk_eu$Flesch.Kincaid
+
+# --- Party Congresses ---
+corpus_pc <- corpus(partycong_ideology, text_field = "texts")
+fk_pc     <- textstat_readability(corpus_pc, measure = "Flesch.Kincaid")
+partycong_ideology$flesch_kincaid <- fk_pc$Flesch.Kincaid
+
+# Quick sanity check: means should be in the 10-15 range
+message("ParlSpeech mean FK: ", round(mean(parlspeech_ideology$flesch_kincaid), 2))
+message("EUSpeech mean FK: ",   round(mean(euspeech_ideology$flesch_kincaid), 2))
+message("PartyCong mean FK: ",  round(mean(partycong_ideology$flesch_kincaid), 2))
+
+```
+
+---
+
+## Governing Party Dummy
+
+We construct a lookup table of which parties were in government during each
+time period, then flag speeches where the speaker's party was in power.
+
+**Note: An LLM (Claude) was used to assist with compiling the governing
+coalition lookup table. All entries were verified against publicly available
+sources (government archives, Wikipedia).**
+
+```{r governing-party}
+
+gov_periods <- tribble(
+  ~countryname,    ~party,          ~gov_start,             ~gov_end,
+
+  # --- GERMANY ---
+  # Kohl (CDU/CSU + FDP): 1990-1998
+  "Germany",       "CDU/CSU",   as.Date("1990-01-01"), as.Date("1998-10-26"),
+  "Germany",       "FDP",       as.Date("1990-01-01"), as.Date("1998-10-26"),
+  # Schroeder (SPD + Greens): 1998-2005
+  "Germany",       "SPD",       as.Date("1998-10-27"), as.Date("2005-11-21"),
+  "Germany",       "90/Greens", as.Date("1998-10-27"), as.Date("2005-11-21"),
+  # Merkel I (CDU/CSU + SPD grand coalition): 2005-2009
+  "Germany",       "CDU/CSU",   as.Date("2005-11-22"), as.Date("2009-10-27"),
+  "Germany",       "SPD",       as.Date("2005-11-22"), as.Date("2009-10-27"),
+  # Merkel II (CDU/CSU + FDP): 2009-2013
+  "Germany",       "CDU/CSU",   as.Date("2009-10-28"), as.Date("2013-12-16"),
+  "Germany",       "FDP",       as.Date("2009-10-28"), as.Date("2013-12-16"),
+  # Merkel III (CDU/CSU + SPD grand coalition): 2013-2015
+  "Germany",       "CDU/CSU",   as.Date("2013-12-17"), as.Date("2015-12-31"),
+  "Germany",       "SPD",       as.Date("2013-12-17"), as.Date("2015-12-31"),
+
+  # --- NETHERLANDS ---
+  # Lubbers III (CDA + PvdA): 1989-1994
+  "Netherlands",   "CDA",       as.Date("1990-01-01"), as.Date("1994-08-21"),
+  "Netherlands",   "PvdA",      as.Date("1990-01-01"), as.Date("1994-08-21"),
+  # Kok I (PvdA + VVD + D'66): 1994-1998
+  "Netherlands",   "PvdA",      as.Date("1994-08-22"), as.Date("1998-08-02"),
+  "Netherlands",   "VVD",       as.Date("1994-08-22"), as.Date("1998-08-02"),
+  "Netherlands",   "D'66",      as.Date("1994-08-22"), as.Date("1998-08-02"),
+  # Kok II (PvdA + VVD + D'66): 1998-2002
+  "Netherlands",   "PvdA",      as.Date("1998-08-03"), as.Date("2002-07-21"),
+  "Netherlands",   "VVD",       as.Date("1998-08-03"), as.Date("2002-07-21"),
+  "Netherlands",   "D'66",      as.Date("1998-08-03"), as.Date("2002-07-21"),
+  # Balkenende I (CDA + VVD + LPF): 2002-2003
+  "Netherlands",   "CDA",       as.Date("2002-07-22"), as.Date("2003-05-26"),
+  "Netherlands",   "VVD",       as.Date("2002-07-22"), as.Date("2003-05-26"),
+  "Netherlands",   "LPF",       as.Date("2002-07-22"), as.Date("2003-05-26"),
+  # Balkenende II (CDA + VVD + D'66): 2003-2006
+  "Netherlands",   "CDA",       as.Date("2003-05-27"), as.Date("2006-07-06"),
+  "Netherlands",   "VVD",       as.Date("2003-05-27"), as.Date("2006-07-06"),
+  "Netherlands",   "D'66",      as.Date("2003-05-27"), as.Date("2006-07-06"),
+  # Balkenende III (CDA + VVD caretaker): 2006-2007
+  "Netherlands",   "CDA",       as.Date("2006-07-07"), as.Date("2007-02-21"),
+  "Netherlands",   "VVD",       as.Date("2006-07-07"), as.Date("2007-02-21"),
+  # Balkenende IV (CDA + PvdA + CU): 2007-2010
+  "Netherlands",   "CDA",       as.Date("2007-02-22"), as.Date("2010-10-13"),
+  "Netherlands",   "PvdA",      as.Date("2007-02-22"), as.Date("2010-10-13"),
+  "Netherlands",   "CU",        as.Date("2007-02-22"), as.Date("2010-10-13"),
+  # Rutte I (VVD + CDA minority): 2010-2012
+  "Netherlands",   "VVD",       as.Date("2010-10-14"), as.Date("2012-11-04"),
+  "Netherlands",   "CDA",       as.Date("2010-10-14"), as.Date("2012-11-04"),
+  # Rutte II (VVD + PvdA): 2012-2015
+  "Netherlands",   "VVD",       as.Date("2012-11-05"), as.Date("2015-12-31"),
+  "Netherlands",   "PvdA",      as.Date("2012-11-05"), as.Date("2015-12-31"),
+
+  # --- SPAIN ---
+  "Spain",         "PSOE",      as.Date("1990-01-01"), as.Date("1996-05-05"),
+  "Spain",         "PP",        as.Date("1996-05-06"), as.Date("2004-04-16"),
+  "Spain",         "PSOE",      as.Date("2004-04-17"), as.Date("2011-12-20"),
+  "Spain",         "PP",        as.Date("2011-12-21"), as.Date("2015-12-31"),
+
+  # --- SWEDEN ---
+  "Sweden",        "SAP",       as.Date("1990-01-01"), as.Date("1991-10-03"),
+  # Bildt coalition (MSP + CP + Kd + FP): 1991-1994
+  "Sweden",        "MSP",       as.Date("1991-10-04"), as.Date("1994-10-06"),
+  "Sweden",        "CP",        as.Date("1991-10-04"), as.Date("1994-10-06"),
+  "Sweden",        "Kd",        as.Date("1991-10-04"), as.Date("1994-10-06"),
+  "Sweden",        "FP",        as.Date("1991-10-04"), as.Date("1994-10-06"),
+  # Carlsson III + Persson (SAP minority): 1994-2006
+  "Sweden",        "SAP",       as.Date("1994-10-07"), as.Date("2006-10-05"),
+  # Reinfeldt (MSP + CP + Kd + FP): 2006-2014
+  "Sweden",        "MSP",       as.Date("2006-10-06"), as.Date("2014-10-02"),
+  "Sweden",        "CP",        as.Date("2006-10-06"), as.Date("2014-10-02"),
+  "Sweden",        "Kd",        as.Date("2006-10-06"), as.Date("2014-10-02"),
+  "Sweden",        "FP",        as.Date("2006-10-06"), as.Date("2014-10-02"),
+  # Loefven (SAP minority): 2014-
+  "Sweden",        "SAP",       as.Date("2014-10-03"), as.Date("2015-12-31"),
+
+  # --- UNITED KINGDOM ---
+  "United Kingdom","Conservatives", as.Date("1990-01-01"), as.Date("1997-05-01"),
+  "United Kingdom","Labour",    as.Date("1997-05-02"), as.Date("2010-05-10"),
+  # Cameron coalition (Con + LibDem): 2010-2015
+  "United Kingdom","Conservatives", as.Date("2010-05-11"), as.Date("2015-12-31"),
+  "United Kingdom","LibDems",   as.Date("2010-05-11"), as.Date("2015-12-31"),
+
+  # --- DENMARK (for Party Congresses) ---
+  "Denmark",       "SD",        as.Date("1993-01-25"), as.Date("2001-11-26"),
+  "Denmark",       "V",         as.Date("2001-11-27"), as.Date("2011-10-02"),
+  "Denmark",       "SD",        as.Date("2011-10-03"), as.Date("2015-06-27"),
+  "Denmark",       "V",         as.Date("2015-06-28"), as.Date("2020-12-31")
+)
+
+# --- Apply governing party dummy to ParlSpeech ---
+parlspeech_ideology <- parlspeech_ideology |>
+  mutate(speech_date = as.Date(date)) |>
+  left_join(gov_periods |> rename(gov_party = party), by = "countryname") |>
+  mutate(in_gov = as.integer(
+    speech_date >= gov_start & speech_date <= gov_end & party == gov_party
+  )) |>
+  group_by(speaker, date) |>
+  slice_max(in_gov, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(-gov_start, -gov_end, -gov_party, -speech_date)
+
+# --- Apply governing party dummy to EUSpeech ---
+euspeech_ideology <- euspeech_ideology |>
+  mutate(speech_date = as.Date(date, format = "%d-%m-%Y")) |>
+  left_join(gov_periods |> rename(gov_party = party),
+            by = c("country" = "countryname")) |>
+  mutate(in_gov = case_when(
+    is.na(gov_party) ~ 0L,
+    speech_date >= gov_start & speech_date <= gov_end &
+      partyabbrev == gov_party ~ 1L,
+    TRUE ~ 0L
+  )) |>
+  group_by(speaker, date) |>
+  slice_max(in_gov, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(-gov_start, -gov_end, -gov_party, -speech_date)
+
+# --- Apply governing party dummy to Party Congresses ---
+partycong_ideology <- partycong_ideology |>
+  mutate(speech_year_int = as.integer(year)) |>
+  left_join(gov_periods |> rename(gov_party = party), by = "countryname") |>
+  mutate(
+    gov_start_year = year(gov_start),
+    gov_end_year   = year(gov_end),
+    in_gov = as.integer(
+      speech_year_int >= gov_start_year &
+      speech_year_int <= gov_end_year &
+      party == gov_party
+    )
+  ) |>
+  group_by(speaker, year) |>
+  slice_max(in_gov, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(-gov_start, -gov_end, -gov_party, -gov_start_year,
+         -gov_end_year, -speech_year_int)
+
+```
+
+---
+
+## Final Assembly
+
+We standardize column names across all three datasets, normalize Flesch-Kincaid
+scores within each dataset (as done in the paper), bind them together, and split
+into the 8 country-level subsets used in the analysis. Year is zero-based
+(relative to the earliest year in each subset).
+
+```{r final-assembly}
+
+# --- Standardize columns ---
+parlspeech_final <- parlspeech_ideology |>
+  mutate(dataset = "parlspeech") |>
+  rename(country = countryname) |>
+  select(speech_year, speech_month, text, speaker, party, partyname,
+         parliament, country, lib_con_scale, left_right_scale,
+         flesch_kincaid, in_gov, dataset)
+
+euspeech_final <- euspeech_ideology |>
+  mutate(dataset = "euspeech") |>
+  rename(text = texts, partyname1 = party, partyabbrev1 = partyabbrev) |>
+  select(speech_year, speech_month, text, speaker, country,
+         lib_con_scale, left_right_scale, flesch_kincaid, in_gov,
+         partyname1, partyabbrev1, dataset) |>
+  rename(partyname = partyname1, party = partyabbrev1) |>
+  select(speech_year, speech_month, text, speaker, party, partyname,
+         country, lib_con_scale, left_right_scale, flesch_kincaid,
+         in_gov, dataset)
+
+partycong_final <- partycong_ideology |>
+  mutate(dataset = "partycong") |>
+  rename(text = texts, partyname1 = party_name, country1 = countryname) |>
+  select(speech_year, text, speaker, party, partyname1, country1,
+         lib_con_scale, left_right_scale, flesch_kincaid, in_gov, dataset) |>
+  rename(partyname = partyname1, country = country1) |>
+  select(speech_year, text, speaker, party, partyname, country,
+         lib_con_scale, left_right_scale, flesch_kincaid, in_gov, dataset)
+
+# --- Keep unstandardized FK for Figure 1, then standardize within dataset ---
+parlspeech_final <- parlspeech_final |>
+  mutate(flesch_kincaid_unstand = flesch_kincaid)
+euspeech_final   <- euspeech_final |>
+  mutate(flesch_kincaid_unstand = flesch_kincaid)
+partycong_final  <- partycong_final |>
+  mutate(flesch_kincaid_unstand = flesch_kincaid)
+
+# Standardize (z-score) FK within each dataset, as done in the paper
+parlspeech_final <- parlspeech_final |>
+  mutate(flesch_kincaid = scale(flesch_kincaid)[, 1])
+euspeech_final   <- euspeech_final |>
+  mutate(flesch_kincaid = scale(flesch_kincaid)[, 1])
+partycong_final  <- partycong_final |>
+  mutate(flesch_kincaid = scale(flesch_kincaid)[, 1])
+
+# --- Merge into one final dataframe ---
+final_data <- bind_rows(parlspeech_final, euspeech_final, partycong_final)
+
+# --- Split into 8 country-level subsets for analysis ---
+dnk      <- final_data |> filter(dataset == "partycong",  country == "Denmark")
+nld_cong <- final_data |> filter(dataset == "partycong",  country == "Netherlands")
+ger      <- final_data |> filter(dataset == "parlspeech", country == "Germany")
+esp      <- final_data |> filter(dataset == "parlspeech", country == "Spain")
+gbr      <- final_data |> filter(dataset == "parlspeech", country == "United Kingdom")
+swe      <- final_data |> filter(dataset == "parlspeech", country == "Sweden")
+nld_parl <- final_data |> filter(dataset == "parlspeech", country == "Netherlands")
+eus      <- final_data |> filter(dataset == "euspeech")
+
+# Zero-base the year variable within each subset
+dnk      <- dnk      |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+nld_cong <- nld_cong |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+ger      <- ger      |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+esp      <- esp      |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+gbr      <- gbr      |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+swe      <- swe      |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+nld_parl <- nld_parl |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+eus      <- eus      |> mutate(speech_year = speech_year - min(speech_year, na.rm = TRUE))
+
+# --- Save final cleaned data, makes sure it's full output---
+if (n_sam == Inf) {
+  save(final_data, dnk, nld_cong, ger, esp, gbr, swe, nld_parl, eus,
+       file = "data/cleaned/cole_final_cleaned_data.RData")
+  message("Final dataset saved. Total observations: ", nrow(final_data))
+}
+
+
+
+```

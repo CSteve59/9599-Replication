@@ -1,0 +1,22 @@
+# R workspace and history
+.RData
+.RDataTmp*
+.Rhistory
+.Rproj.user/
+
+# R Markdown intermediates
+*.knit.md
+*_cache/
+*_files/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large data files (exceed GitHub's 100MB limit)
+# These must be downloaded from their original sources (see README)
+data/raw/ParlSpeech/*.Rdata
+data/raw/EUSpeech/*.RData
+data/raw/PartyCongressSpeech/*.Rdata
+data/raw/ManifestoProject/*.xlsx
+data/cleaned/*.RData

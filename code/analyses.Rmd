@@ -1,0 +1,489 @@
+---
+title: "Analysis – Replication of Schoonvelde et al. (2019)"
+author: "Colton Stevenson"
+date: "April 3rd 2026"
+output:
+  html_document:
+    theme: darkly
+    toc: true
+    toc_float: 
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 5
+    highlight: zenburn
+---
+
+## Overview
+
+This notebook reproduces the main analyses from:
+
+> Schoonvelde, M., Brosius, A., & van Atteveldt, W. (2019). Liberals lecture,
+> conservatives communicate: Analyzing complexity and ideology in 381,609
+> political speeches. *PLOS ONE*, 14(2), e0208450.
+
+We replicate the descriptive statistics (Tables A.1-A.8), the four main figures,
+and the OLS regression tables (with and without speaker fixed effects).
+
+**Input:** `data/cleaned/cole_final_cleaned_data.RData` (produced by `cleaning.Rmd`)
+
+---
+
+## Setup
+
+### Libraries
+
+```{r load-libraries, message = FALSE, warning = FALSE}
+
+library(tidyverse)          # data wrangling and plotting
+library(tidylog)            # verbose dplyr output
+library(tidytext)           # tidy text tools
+library(textdata)           # text datasets
+library(quanteda)           # corpus tools
+library(quanteda.textstats) # readability
+library(wesanderson)        # colour palettes
+library(knitr)              # table formatting
+library(stringr)            # string manipulation
+library(readxl)             # reading Excel files
+library(cld2)               # language detection
+library(DAMisc)             # summary statistics helpers
+library(broom)              # tidy model output
+library(patchwork)          # combining ggplots
+library(stargazer)          # regression tables
+
+```
+
+### Load Data
+
+```{r load-data, warning = FALSE}
+
+# Set working directory to project root
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+setwd("..")
+
+# Load the final cleaned dataset (produced by cleaning.Rmd)
+# Contains: final_data, dnk, nld_cong, ger, esp, gbr, swe, nld_parl, eus
+load("data/cleaned/cole_final_cleaned_data.RData")
+
+```
+
+---
+
+## Descriptive Statistics
+
+These tables match the appendix tables in the original paper. Each table shows
+summary statistics for the five key variables across all 8 corpora.
+
+```{r descriptive-stats, warning = FALSE}
+
+# Function to produce a summary statistics table for a given dataset
+sum_stats_table <- function(df, title) {
+  vars   <- c("flesch_kincaid", "left_right_scale", "lib_con_scale",
+               "speech_year", "in_gov")
+  labels <- c("Complexity", "Left-Right", "Progressive-Conservative",
+               "Year", "In government")
+
+  map2_dfr(vars, labels, ~ {
+    x <- df[[.x]]
+    tibble(
+      Statistic  = .y,
+      N          = format(sum(!is.na(x)), big.mark = ","),
+      Mean       = round(mean(x, na.rm = TRUE), 3),
+      `St. Dev.` = round(sd(x, na.rm = TRUE), 3),
+      Min        = round(min(x, na.rm = TRUE), 3),
+      `Pctl(25)` = round(quantile(x, .25, na.rm = TRUE), 3),
+      `Pctl(75)` = round(quantile(x, .75, na.rm = TRUE), 3),
+      Max        = round(max(x, na.rm = TRUE), 3)
+    )
+  }) |>
+    kable(caption = title, align = c("l", rep("r", 7)))
+}
+
+# Generate all 8 descriptive statistics tables
+dnk      |> sum_stats_table("Table A.1: Party congresses DNK")
+nld_cong |> sum_stats_table("Table A.2: Party congresses NLD")
+ger      |> sum_stats_table("Table A.3: Parliament GER")
+esp      |> sum_stats_table("Table A.4: Parliament ESP")
+gbr      |> sum_stats_table("Table A.5: Parliament GBR")
+swe      |> sum_stats_table("Table A.6: Parliament SWE")
+nld_parl |> sum_stats_table("Table A.7: Parliament NLD")
+eus      |> sum_stats_table("Table A.8: Heads of Government")
+
+```
+
+---
+
+## Figure 1: Descriptive Information
+
+This figure shows mean complexity scores for selected EU speakers, illustrating
+the the Flesch-Kincaid score's ability to measure complexity.
+
+
+```{r figure-1, fig.keep="none"}
+
+fig_1_rep <- eus |>
+  filter(speaker %in% c("G. Brown", "D. Cameron",
+                         "J.L.R. Zapatero", "M. Rajoy")) |>
+  group_by(speaker) |>
+  summarise(
+    mean_complexity = mean(flesch_kincaid_unstand, na.rm = TRUE),
+    se = sd(flesch_kincaid, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) |>
+  mutate(
+    speaker = fct_reorder(speaker, mean_complexity),
+    ideology = case_when(
+      speaker %in% c("G. Brown", "J.L.R. Zapatero") ~ "Liberal",
+      speaker %in% c("D. Cameron", "M. Rajoy")       ~ "Conservative"
+    )
+  ) |>
+  ggplot(aes(x = mean_complexity, y = speaker, fill = ideology)) +
+  geom_col() +
+  geom_errorbar(aes(xmin = mean_complexity - 1.96 * se,
+                    xmax = mean_complexity + 1.96 * se),
+                width = 0.2) +
+  scale_fill_manual(
+    values = c("Liberal" = "#E69F00", "Conservative" = "#56B4E9"),
+    name = NULL
+  ) +
+  labs(x = "Mean Complexity", y = NULL,
+       title = "Fig 1: Descriptive information on linguistic complexity") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+fig_1_rep
+
+# Save figure
+ggsave("../figures/cole-fig-1.png", fig_1_rep, width = 8, height = 5)
+
+```
+
+---
+
+## Figure 2: Effect of Ideology on Complexity
+
+This replicates the paper's main result figure. For each of the 8 corpora, we
+run an OLS regression of standardized FK scores on standardized ideology
+(lib-con and left-right), year, and governing party status, then plot the
+coefficients with 95% confidence intervals.
+
+```{r figure-2, fig.width = 12, fig.height = 8, fig.keep="none"}
+
+# Define all 8 datasets
+datasets <- list(
+  "Parliament GER"         = ger,
+  "Parliament ESP"         = esp,
+  "Parliament GBR"         = gbr,
+  "Parliament SWE"         = swe,
+  "Parliament NLD"         = nld_parl,
+  "Party congresses DNK"   = dnk,
+  "Party congresses NLD"   = nld_cong,
+  "Heads of Government"    = eus
+)
+
+# Run OLS for each dataset, extract ideology coefficients
+results <- map_dfr(names(datasets), function(name) {
+  df <- datasets[[name]] |>
+    mutate(across(c(flesch_kincaid, lib_con_scale,
+                    left_right_scale, speech_year), scale))
+
+  model <- lm(flesch_kincaid ~ lib_con_scale + left_right_scale +
+               speech_year + in_gov, data = df)
+
+  tidy(model, conf.int = TRUE) |>
+    filter(term %in% c("lib_con_scale", "left_right_scale")) |>
+    mutate(dataset = name)
+})
+
+# Add panel grouping for faceting (Parliament vs Congress/HoG)
+results <- results |>
+  mutate(
+    panel = ifelse(str_detect(dataset, "Parliament"),
+                   "Parliament", "Congress and Heads of Government"),
+    panel = factor(panel,
+                   levels = c("Parliament", "Congress and Heads of Government")),
+    dataset = factor(dataset, levels = rev(c(
+      "Parliament GER", "Parliament ESP", "Parliament GBR",
+      "Parliament SWE", "Parliament NLD",
+      "Party congresses DNK", "Party congresses NLD", "Heads of Government"
+    )))
+  )
+
+# Panel a: Liberal-Conservative ideology effect
+p2a <- results |>
+  filter(term == "lib_con_scale") |>
+  ggplot(aes(x = estimate, y = dataset)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~panel, scales = "free_y", ncol = 1) +
+  labs(x = "Effect of lib-cons ideology", y = NULL, title = "a") +
+  theme_minimal()
+
+# Panel b: Left-Right ideology effect
+p2b <- results |>
+  filter(term == "left_right_scale") |>
+  ggplot(aes(x = estimate, y = dataset)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~panel, scales = "free_y", ncol = 1) +
+  labs(x = "Effect of left-right ideology", y = NULL, title = "b") +
+  theme_minimal()
+
+fig_2_plot <- p2a + p2b
+fig_2_plot
+
+ggsave("../figures/cole-fig-2.png", fig_2_plot, width = 12, height = 8)
+
+```
+
+---
+
+## Figure 3: Complexity Over Time
+
+This figure shows smoothed trends in speech complexity over time, separately
+for parliamentary speeches and party congress speeches.
+
+```{r figure-3, fig.width = 12, fig.height = 6, fig.keep="none"}
+
+# Panel a: Parliamentary speeches (5 countries)
+p3a <- bind_rows(
+  esp      |> mutate(corpus = "ESP"),
+  gbr      |> mutate(corpus = "GBR"),
+  ger      |> mutate(corpus = "GER"),
+  nld_parl |> mutate(corpus = "NLD"),
+  swe      |> mutate(corpus = "SWE")
+) |>
+  mutate(
+    corpus = factor(corpus, levels = c("ESP", "GBR", "GER", "NLD", "SWE")),
+    year = speech_year + 1988  # convert zero-based year back to calendar year
+  ) |>
+  ggplot(aes(x = year, y = flesch_kincaid_unstand)) +
+  geom_smooth(method = "loess", se = FALSE, color = "red", span = 0.5) +
+  facet_wrap(~corpus, nrow = 1, scales = "free_x") +
+  scale_x_continuous(breaks = c(1990, 2000, 2010),
+                     labels = c("'90", "'00", "'10")) +
+  labs(x = NULL, y = "Complexity", title = "a") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+
+# Panel b: Party congress speeches (Denmark and Netherlands)
+p3b <- bind_rows(
+  dnk      |> mutate(corpus = "DNK"),
+  nld_cong |> mutate(corpus = "NLD")
+) |>
+  mutate(
+    corpus = factor(corpus, levels = c("DNK", "NLD")),
+    year = speech_year + 1944  # convert zero-based year back to calendar year
+  ) |>
+  ggplot(aes(x = year, y = flesch_kincaid_unstand)) +
+  geom_smooth(method = "loess", se = FALSE, color = "red", span = 0.5) +
+  facet_wrap(~corpus, nrow = 1, scales = "free_x") +
+  scale_x_continuous(breaks = c(1960, 1980, 2000),
+                     labels = c("'60", "'80", "'00")) +
+  labs(x = NULL, y = "Complexity", title = "b") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+
+fig_3_plot <- p3a + p3b
+fig_3_plot
+
+ggsave("../figures/cole-fig-3.png", fig_3_plot, width = 12, height = 6)
+
+```
+
+---
+
+## Figure 4: Party Fixed Effects
+
+Panel (a) shows OLS coefficients for the effect of conservatism with party
+fixed effects included. Panel (b) shows within-party loess trends for ideology
+and complexity over time for two illustrative parties.
+
+```{r figure-4, fig.width = 12, fig.height = 6, fig.keep="none"}
+
+# --- Panel a: Party fixed effects (excluding EUSpeech) ---
+datasets_noeus <- list(
+  "Parliament GER"       = ger,
+  "Parliament ESP"       = esp,
+  "Parliament GBR"       = gbr,
+  "Parliament SWE"       = swe,
+  "Parliament NLD"       = nld_parl,
+  "Party congresses DNK" = dnk,
+  "Party congresses NLD" = nld_cong
+)
+
+# Run OLS with party FE for each corpus
+results_fe <- map_dfr(names(datasets_noeus), function(name) {
+  df <- datasets_noeus[[name]] |>
+    mutate(across(c(flesch_kincaid, lib_con_scale,
+                    left_right_scale, speech_year), scale))
+
+  model <- lm(flesch_kincaid ~ lib_con_scale + left_right_scale +
+               speech_year + in_gov + factor(party), data = df)
+
+  tidy(model, conf.int = TRUE) |>
+    filter(term == "lib_con_scale") |>
+    mutate(dataset = name)
+})
+
+results_fe <- results_fe |>
+  mutate(
+    panel = ifelse(str_detect(dataset, "Parliament"), "Parliament", "Congress"),
+    panel = factor(panel, levels = c("Parliament", "Congress")),
+    dataset = factor(dataset, levels = rev(c(
+      "Parliament GER", "Parliament ESP", "Parliament GBR",
+      "Parliament SWE", "Parliament NLD",
+      "Party congresses DNK", "Party congresses NLD"
+    )))
+  )
+
+p4a <- results_fe |>
+  ggplot(aes(x = estimate, y = dataset)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "solid") +
+  facet_wrap(~panel, scales = "free_y", ncol = 1) +
+  labs(x = "Fixed effect of conservatism", y = NULL, title = "a") +
+  theme_minimal()
+
+# --- Panel b: Within-party trends (SD in Denmark, VVD in Netherlands) ---
+sd_data <- dnk |>
+  filter(party == "SD") |>
+  mutate(
+    year       = speech_year + 1944,
+    complexity = scale(flesch_kincaid)[, 1],
+    ideology   = scale(lib_con_scale)[, 1]
+  ) |>
+  select(year, complexity, ideology) |>
+  pivot_longer(c(complexity, ideology),
+               names_to = "variable", values_to = "value") |>
+  mutate(corpus = "Social Democratic Party\n(DK)")
+
+vvd_data <- nld_cong |>
+  filter(party == "VVD") |>
+  mutate(
+    year       = speech_year + 1944,
+    complexity = scale(flesch_kincaid)[, 1],
+    ideology   = scale(lib_con_scale)[, 1]
+  ) |>
+  select(year, complexity, ideology) |>
+  pivot_longer(c(complexity, ideology),
+               names_to = "variable", values_to = "value") |>
+  mutate(corpus = "Liberal Party\n(NL)")
+
+p4b <- bind_rows(sd_data, vvd_data) |>
+  mutate(corpus = factor(corpus,
+    levels = c("Social Democratic Party\n(DK)", "Liberal Party\n(NL)")
+  )) |>
+  ggplot(aes(x = year, y = value, color = variable)) +
+  geom_smooth(method = "loess", se = FALSE, span = 0.5) +
+  facet_wrap(~corpus, ncol = 1) +
+  scale_color_manual(values = c("complexity" = "blue", "ideology" = "red")) +
+  labs(x = NULL, y = "Standardized values", color = NULL, title = "b") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text.y = element_text(angle = 0))
+
+fig_4_plot <- p4a + p4b
+fig_4_plot
+
+ggsave("../figures/cole-fig-4.png", fig_4_plot, width = 12, height = 6)
+
+```
+
+---
+
+## OLS Regression Tables
+
+### Standard OLS (No Fixed Effects)
+
+These models regress standardized Flesch-Kincaid scores on ideology (left-right
+and lib-con), year, and governing party status. The EUSpeech model excludes
+year and governing status due to the smaller sample of heads of government.
+
+```{r ols-table-1, results = 'asis'}
+
+m_dnk      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                  speech_year + in_gov, data = dnk)
+m_nld_cong <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                  speech_year + in_gov, data = nld_cong)
+m_ger      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                  speech_year + in_gov, data = ger)
+m_esp      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                  speech_year + in_gov, data = esp)
+m_gbr      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                  speech_year + in_gov, data = gbr)
+m_swe      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                  speech_year + in_gov, data = swe)
+m_nld_parl <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                  speech_year + in_gov, data = nld_parl)
+m_eus      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale,
+                  data = eus)
+
+stargazer(m_dnk, m_nld_cong, m_ger, m_esp,
+          title = "Table C.1: OLS regression results",
+          column.labels = c("DNK Congress", "NLD Congress",
+                            "GER Parl", "ESP Parl"),
+          covariate.labels = c("Left-Right", "Progressive-Conservative",
+                               "Year", "In government"),
+          type = "html",
+          star.cutoffs = c(0.1, 0.05, 0.01))
+
+stargazer(m_gbr, m_swe, m_nld_parl, m_eus,
+          title = "Table C.1 continued",
+          column.labels = c("GBR Parl", "SWE Parl", "NLD Parl", "PM"),
+          covariate.labels = c("Left-Right", "Progressive-Conservative",
+                               "Year", "In government"),
+          type = "html",
+          star.cutoffs = c(0.1, 0.05, 0.01))
+
+```
+
+### Speaker Fixed Effects
+
+These models add speaker fixed effects to control for individual speaking
+styles. This tests whether the ideology-complexity relationship holds
+*within speakers* as their party's ideology shifts.
+
+```{r ols-table-2, results = 'asis'}
+
+m_dnk_fe      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                     speech_year + in_gov + factor(speaker), data = dnk)
+m_nld_cong_fe <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                     speech_year + in_gov + factor(speaker), data = nld_cong)
+m_ger_fe      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                     speech_year + in_gov + factor(speaker), data = ger)
+m_esp_fe      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                     speech_year + in_gov + factor(speaker), data = esp)
+m_gbr_fe      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                     speech_year + in_gov + factor(speaker), data = gbr)
+m_swe_fe      <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                     speech_year + in_gov + factor(speaker), data = swe)
+m_nld_parl_fe <- lm(flesch_kincaid ~ left_right_scale + lib_con_scale +
+                     speech_year + in_gov + factor(speaker), data = nld_parl)
+
+stargazer(m_dnk_fe, m_nld_cong_fe, m_ger_fe, m_esp_fe,
+          title = "Table D.1: Speaker fixed effects regression results",
+          column.labels = c("DNK Congress", "NLD Congress",
+                            "GER Parl", "ESP Parl"),
+          covariate.labels = c("Left-Right", "Progressive-Conservative",
+                               "Year", "In government"),
+          omit = "factor\\(speaker\\)",
+          add.lines = list(c("Speaker Fixed Effects?",
+                             "Yes", "Yes", "Yes", "Yes")),
+          type = "html",
+          star.cutoffs = c(0.1, 0.05, 0.01))
+
+stargazer(m_gbr_fe, m_swe_fe, m_nld_parl_fe,
+          title = "Table D.1 continued",
+          column.labels = c("GBR Parl", "SWE Parl", "NLD Parl"),
+          covariate.labels = c("Left-Right", "Progressive-Conservative",
+                               "Year", "In government"),
+          omit = "factor\\(speaker\\)",
+          add.lines = list(c("Speaker Fixed Effects?",
+                             "Yes", "Yes", "Yes")),
+          type = "html",
+          star.cutoffs = c(0.1, 0.05, 0.01))
+
+```
