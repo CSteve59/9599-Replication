@@ -119,3 +119,4 @@ The raw data is publicly available from the following sources:
 An LLM (Claude) was used to assist with two specific data compilation tasks:
 1. Researching and compiling party affiliations for ~60 EUSpeech speakers (the raw data does not include party information).
 2. Compiling the governing coalition lookup table (which parties were in government during which periods).
+3. Fixing party variable names for ideology matching
